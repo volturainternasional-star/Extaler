@@ -1,281 +1,369 @@
-#!/data/data/com.termux/files/usr/bin/python3
-"""
-ARK Mobile Mod Extractor & Converter
-Pipeline:
-1. Retoc membaca index .utoc.
-2. Tool mengambil compressed chunk dari .ucas (via unpack-raw + parse TOC).
-3. Unoodle mendekompresi blok Oodle dengan ukuran exact dari TOC.
-4. Retoc memproses kembali data package (to-legacy / unpack).
+cd ~/Extaler
 
-Catatan:
-- Unoodle tidak otomatis dekompresi seluruh .ucas.
-- File original tidak pernah diubah.
-- Hasil adalah asset PC (WindowsServer).
-"""
+cp Arkmod.py Arkmod.py.backup
+
+cat > Arkmod.py <<'PY'
+#!/data/data/com.termux/files/usr/bin/python3
 
 import argparse
 import os
 import sys
-import subprocess
 import shutil
-import tempfile
-import struct
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
-RETOC = os.path.expanduser("\~/retoc/target/release/retoc")
-REPAK = os.path.expanduser("\~/repak/target/release/repak")
-UNOODLE = "unoodle"
+HOME = Path.home()
 
-SPYGLASS_DIR = os.path.expanduser("\~/ark-mods/inspection/spyglass/AwesomeSpyglass/Content/Paks/WindowsServer")
-FIELD_DIR = os.path.expanduser("\~/ark-mods/inspection/field/FieldGenerators/Content/Paks/WindowsServer")
-EXTRACTED_BASE = os.path.expanduser("\~/ark-mods/extracted")
+RETOC = HOME / "retoc/target/release/retoc"
+REPAK = HOME / "repak/target/release/repak"
 
-def log(msg, level="INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
+UNOODLE_CANDIDATES = [
+    shutil.which("unoodle"),
+    str(HOME / ".cargo/bin/unoodle"),
+    str(HOME / "bin/unoodle"),
+]
 
-def run(cmd, cwd=None, timeout=3600):
-    log(f"Menjalankan: {' '.join(cmd)}")
+SPYGLASS_DIR = (
+    HOME / "ark-mods/inspection/spyglass/AwesomeSpyglass/Content/Paks/WindowsServer"
+)
+
+FIELD_DIR = (
+    HOME / "ark-mods/inspection/field/FieldGenerators/Content/Paks/WindowsServer"
+)
+
+OUTPUT_BASE = HOME / "ark-mods/extracted"
+LOG_DIR = HOME / "ark-mods/logs"
+
+
+def log(message, level="INFO"):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [{level}] {message}", flush=True)
+
+
+def find_unoodle():
+    for candidate in UNOODLE_CANDIDATES:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def run_command(command, logfile, timeout=3600):
+    log("$ " + " ".join(map(str, command)))
+
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            list(map(str, command)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+
+        output = result.stdout or ""
+
+        Path(logfile).parent.mkdir(parents=True, exist_ok=True)
+        with open(logfile, "a", encoding="utf-8") as f:
+            f.write("\n\n$ " + " ".join(map(str, command)) + "\n")
+            f.write(output)
+
+        if output:
+            print(output[-6000:], flush=True)
+
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
-            log(f"Error (code {result.returncode}): {err[:800]}", "ERROR")
-            return False, err
-        if result.stdout:
-            print(result.stdout)
-        return True, result.stdout
+            log(f"Command gagal: exit code {result.returncode}", "ERROR")
+            return False, output
+
+        return True, output
+
     except subprocess.TimeoutExpired:
-        log("Timeout", "ERROR")
-        return False, "timeout"
-    except Exception as e:
-        log(f"Exception: {e}", "ERROR")
-        return False, str(e)
+        log("Command timeout", "ERROR")
+        return False, "TIMEOUT"
+
+    except Exception as error:
+        log(f"Kesalahan menjalankan command: {error}", "ERROR")
+        return False, str(error)
+
 
 def check_tools():
     missing = []
-    if not os.path.exists(RETOC):
-        missing.append(f"retoc tidak ditemukan di {RETOC}")
-    if not os.path.exists(REPAK):
-        missing.append(f"repak tidak ditemukan di {REPAK}")
-    if shutil.which(UNOODLE) is None and not os.path.exists(os.path.expanduser("\~/bin/unoodle")):
-        log("unoodle tidak ditemukan di PATH. Fallback Oodle akan terbatas.", "WARN")
+
+    if not RETOC.is_file():
+        missing.append(f"Retoc tidak ditemukan: {RETOC}")
+
+    if not REPAK.is_file():
+        missing.append(f"Repak tidak ditemukan: {REPAK}")
+
+    uno = find_unoodle()
+
+    if not uno:
+        log("Unoodle tidak ditemukan.", "WARN")
+    else:
+        log(f"Unoodle: {uno}")
+
     if missing:
-        for m in missing:
-            log(m, "ERROR")
+        for item in missing:
+            log(item, "ERROR")
         return False
+
     return True
 
-def find_utoc(input_dir):
-    for f in sorted(os.listdir(input_dir)):
-        if f.endswith(".utoc"):
-            return os.path.join(input_dir, f)
-    return None
 
-def find_ucas(utoc_path):
-    base = utoc_path[:-5]
-    for ext in (".ucas", ".UCAS"):
-        p = base + ext
-        if os.path.exists(p):
-            return p
-    return None
-
-def parse_toc_compression_blocks(utoc_path):
-    """Baca FIoStoreTocCompressedBlockEntry dari .utoc."""
-    try:
-        with open(utoc_path, "rb") as f:
-            data = f.read()
-    except Exception as e:
-        log(f"Gagal baca .utoc: {e}", "ERROR")
+def find_utoc(folder):
+    if not folder.is_dir():
         return None
 
-    if len(data) < 144 or data[:16] != b"-==--==--==--==-":
-        log("Magic .utoc tidak cocok atau file terlalu kecil", "WARN")
-        return None
+    files = sorted(folder.glob("*.utoc"))
+    return files[0] if files else None
 
-    version = data[16]
-    toc_header_size = struct.unpack_from("<I", data, 20)[0]
-    entry_count = struct.unpack_from("<I", data, 24)[0]
-    compressed_block_count = struct.unpack_from("<I", data, 28)[0]
-    compressed_block_entry_size = struct.unpack_from("<I", data, 32)[0]
 
-    log(f"TOC: version={version}, entries={entry_count}, "
-        f"comp_blocks={compressed_block_count}, block_entry_size={compressed_block_entry_size}")
+def find_ucas(utoc):
+    candidate = utoc.with_suffix(".ucas")
+    return candidate if candidate.is_file() else None
 
-    if compressed_block_entry_size != 12 or compressed_block_count == 0:
-        log("Tidak ada compression block yang bisa diparse", "WARN")
-        return []
 
-    base = toc_header_size
-    base += 12 * entry_count   # FIoChunkId
-    base += 10 * entry_count   # FIoOffsetAndLength
+def count_files(folder):
+    if not folder.exists():
+        return 0
+    return sum(1 for item in folder.rglob("*") if item.is_file())
 
-    blocks = []
-    if base + 12 * compressed_block_count <= len(data):
-        for i in range(compressed_block_count):
-            off = base + i * 12
-            raw = data[off:off+12]
-            if len(raw) < 12:
-                break
-            offset_comp = struct.unpack_from("<Q", raw, 0)[0]
-            uncomp_method = struct.unpack_from("<I", raw, 8)[0]
 
-            offset = offset_comp & ((1 << 40) - 1)
-            compressed_size = (offset_comp >> 40) & ((1 << 24) - 1)
-            uncompressed_size = uncomp_method & ((1 << 24) - 1)
-            method = (uncomp_method >> 24) & 0xFF
+def inspect_container(utoc, logfile):
+    log("Memeriksa index IoStore...")
 
-            blocks.append({
-                "offset": offset,
-                "compressed_size": compressed_size,
-                "uncompressed_size": uncompressed_size,
-                "method": method,
-            })
+    run_command(
+        [RETOC, "info", utoc],
+        logfile,
+        timeout=300,
+    )
 
-    if blocks:
-        log(f"Berhasil parse {len(blocks)} compression blocks dari TOC")
-        for b in blocks[:3]:
-            log(f"  sample: off={b['offset']} csize={b['compressed_size']} "
-                f"usize={b['uncompressed_size']} method={b['method']}")
-        return blocks
+    run_command(
+        [RETOC, "list", utoc],
+        logfile,
+        timeout=300,
+    )
 
-    log("Gagal parse compression blocks dari TOC", "WARN")
-    return None
 
-def extract_and_decompress_blocks(ucas_path, output_dir, blocks):
-    """Ambil blok tepat dari .ucas sesuai TOC, dekompresi dengan unoodle exact size."""
-    if not blocks or not ucas_path or not os.path.exists(ucas_path):
-        return False
+def extract_iostore(name, input_dir, output_dir):
+    log("=" * 55)
+    log(f"MOD: {name}")
+    log(f"INPUT : {input_dir}")
+    log(f"OUTPUT: {output_dir}")
 
-    os.makedirs(output_dir, exist_ok=True)
-    uno = shutil.which(UNOODLE) or os.path.expanduser("\~/bin/unoodle")
-    if not os.path.exists(uno):
-        log("unoodle tidak tersedia", "WARN")
-        return False
-    if shutil.which(UNOODLE):
-        uno = UNOODLE
-
-    success = 0
-    with open(ucas_path, "rb") as ucas:
-        for i, b in enumerate(blocks):
-            if b["compressed_size"] == 0 or b["uncompressed_size"] == 0 or b["method"] == 0:
-                continue
-
-            try:
-                ucas.seek(b["offset"])
-                compressed = ucas.read(b["compressed_size"])
-            except Exception as e:
-                log(f"Gagal baca blok {i}: {e}", "WARN")
-                continue
-
-            if len(compressed) != b["compressed_size"]:
-                continue
-
-            tmp_in = os.path.join(output_dir, f"block_{i:06d}.comp")
-            tmp_out = os.path.join(output_dir, f"block_{i:06d}.bin")
-            with open(tmp_in, "wb") as f:
-                f.write(compressed)
-
-            cmd = [
-                uno,
-                "--length", str(b["uncompressed_size"]),
-                "--header", "0",
-                tmp_in,
-                "-o", tmp_out,
-                "-v",
-            ]
-            ok, _ = run(cmd, timeout=60)
-            if ok and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
-                actual = os.path.getsize(tmp_out)
-                if actual == b["uncompressed_size"]:
-                    log(f"Blok {i}: Unoodle OK (exact size match {actual})")
-                    success += 1
-                else:
-                    log(f"Blok {i}: Unoodle OK tapi ukuran tidak cocok "
-                        f"(dapat {actual}, diharapkan {b['uncompressed_size']}) — TIDAK divalidasi", "WARN")
-            else:
-                log(f"Blok {i}: Unoodle gagal (method={b['method']}, usize={b['uncompressed_size']})", "WARN")
-
-            if os.path.exists(tmp_in):
-                os.remove(tmp_in)
-
-    log(f"Dekompresi blok akurat selesai: {success}/{len(blocks)}")
-    return success > 0
-
-def retoc_read_index(utoc_path):
-    log(f"Retoc membaca index: {os.path.basename(utoc_path)}")
-    ok_info, _ = run([RETOC, "info", utoc_path])
-    ok_list, _ = run([RETOC, "list", utoc_path])
-    return ok_info or ok_list
-
-def extract_raw_chunks(utoc_path, raw_out_dir):
-    os.makedirs(raw_out_dir, exist_ok=True)
-    log(f"Ambil raw chunks ke {raw_out_dir}")
-    for extra in [[], ["--override-container-header-version", "PreInitial"]]:
-        cmd = [RETOC] + extra + ["unpack-raw", utoc_path, raw_out_dir]
-        ok, _ = run(cmd)
-        if ok:
-            log("unpack-raw berhasil")
-            return True
-    log("unpack-raw gagal", "WARN")
-    return False
-
-def retoc_process_packages(input_for_retoc, final_out_dir):
-    os.makedirs(final_out_dir, exist_ok=True)
-    log(f"Retoc proses ulang → {final_out_dir}")
-
-    # to-legacy: retoc to-legacy <INPUT> <OUTPUT>
-    cmd = [RETOC, "to-legacy", input_for_retoc, final_out_dir, "--no-shaders"]
-    ok, _ = run(cmd)
-    if ok:
-        log("to-legacy berhasil")
-        return True
-
-    # unpack: retoc unpack <UTOC> <OUTPUT>  (positional, bukan --output)
-    cmd = [RETOC, "unpack", input_for_retoc, final_out_dir]
-    ok, _ = run(cmd)
-    if ok:
-        log("unpack berhasil")
-        return True
-
-    log("Retoc gagal memproses ulang", "WARN")
-    return False
-
-def analyze_compatibility(extracted_dir):
-    log("Analisis kompatibilitas (sederhana):")
-    uassets = list(Path(extracted_dir).rglob("*.uasset"))
-    log(f"  Jumlah .uasset: {len(uassets)}")
-    log("  Catatan: Asset PC (WindowsServer) TIDAK otomatis kompatibel dengan ARK Mobile.")
-    log("  Perbedaan: UE version, platform, cooking, Blueprint, dependency.")
-    log("  Jangan anggap hasil ini sebagai mod mobile yang siap pakai.")
-
-def process_mod(name, input_dir, output_subdir):
-    final_out = os.path.join(EXTRACTED_BASE, output_subdir)
-    log(f"=== Memproses {name} ===")
-    log(f"Input : {input_dir}")
-    log(f"Output: {final_out}")
-
-    if not os.path.isdir(input_dir):
-        log(f"Direktori tidak ditemukan: {input_dir}", "ERROR")
+    if not input_dir.is_dir():
+        log("Folder input tidak ditemukan.", "ERROR")
         return False
 
     utoc = find_utoc(input_dir)
-    if not utoc:
-        log("Tidak ditemukan .utoc. Coba mode .pak...", "WARN")
-        paks = [f for f in os.listdir(input_dir) if f.endswith(".pak")]
-        if not paks:
-            log("Tidak ada .utoc maupun .pak", "ERROR")
-            return False
-        os.makedirs(final_out, exist_ok=True)
-        ok, _ = run([REPAK, "unpack", os.path.join(input_dir, paks[0]), final_out])
-        if ok:
-            analyze_compatibility(final_out)
-        return ok
 
-    retoc_read_index(utoc)
+    if not utoc:
+        log("File .utoc tidak ditemukan.", "ERROR")
+        return False
+
     ucas = find_ucas(utoc)
-    blocks = parse_toc_compression_blocks(utoc)
+
+    if not ucas:
+        log("Pasangan file .ucas tidak ditemukan.", "ERROR")
+        return False
+
+    if ucas.stat().st_size == 0 or utoc.stat().st_size == 0:
+        log("File IoStore kosong.", "ERROR")
+        return False
+
+    log(f"UTOC: {utoc.name} ({utoc.stat().st_size} bytes)")
+    log(f"UCAS: {ucas.name} ({ucas.stat().st_size} bytes)")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logfile = LOG_DIR / f"{name.lower().replace(' ', '_')}.log"
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+
+    inspect_container(utoc, logfile)
+
+    # Retoc unpack menggunakan format:
+    # retoc unpack <UTOC> <OUTPUT>
+    log("Memulai ekstraksi IoStore menggunakan Retoc...")
+
+    success, output = run_command(
+        [RETOC, "unpack", utoc, output_dir],
+        logfile,
+        timeout=3600,
+    )
+
+    extracted = count_files(output_dir)
+
+    if success and extracted > 0:
+        log(f"Ekstraksi berhasil: {extracted} file.")
+        return True
+
+    log("Retoc belum berhasil mengekstrak container.", "ERROR")
+
+    error_text = output.lower()
+
+    if "oodle" in error_text:
+        log(
+            "Retoc gagal pada dekompresi Oodle. "
+            "Build Retoc ini belum memiliki decoder Oodle yang berfungsi.",
+            "ERROR",
+        )
+
+    log(f"Jumlah file output saat ini: {extracted}")
+    log(f"Log lengkap: {logfile}")
+
+    return False
+
+
+def extract_legacy_pak(pak, output_dir):
+    logfile = LOG_DIR / "legacy_pak.log"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log("Mencoba ekstraksi PAK legacy menggunakan Repak...")
+
+    success, _ = run_command(
+        [REPAK, "unpack", pak, "--output", output_dir],
+        logfile,
+        timeout=3600,
+    )
+
+    extracted = count_files(output_dir)
+
+    if success and extracted > 0:
+        log(f"PAK berhasil diekstrak: {extracted} file.")
+        return True
+
+    log("Ekstraksi PAK gagal. Periksa log Repak.", "ERROR")
+    return False
+
+
+def process_mod(name, input_dir, output_name):
+    output_dir = OUTPUT_BASE / output_name
+
+    if output_dir.exists():
+        log(f"Folder output sudah ada: {output_dir}", "WARN")
+        log("File lama tidak dihapus atau ditimpa otomatis.", "WARN")
+        output_dir = OUTPUT_BASE / (
+            output_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+
+    utoc = find_utoc(input_dir)
+
+    if utoc:
+        return extract_iostore(name, input_dir, output_dir)
+
+    if not input_dir.is_dir():
+        log(f"Folder tidak ditemukan: {input_dir}", "ERROR")
+        return False
+
+    pak_files = sorted(input_dir.glob("*.pak"))
+
+    if not pak_files:
+        log(f"Tidak ditemukan .utoc maupun .pak di {input_dir}", "ERROR")
+        return False
+
+    return extract_legacy_pak(pak_files[0], output_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ARK IoStore extractor for Termux"
+    )
+
+    parser.add_argument(
+        "command",
+        choices=["check", "list", "extract"],
+    )
+
+    parser.add_argument(
+        "--mod",
+        choices=["spyglass", "field", "both"],
+        default="both",
+    )
+
+    args = parser.parse_args()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+    if not check_tools():
+        sys.exit(1)
+
+    if args.command == "check":
+        log(f"Retoc : {RETOC}")
+        log(f"Repak : {REPAK}")
+        log(f"Unoodle: {find_unoodle() or 'tidak ditemukan'}")
+
+        run_command(
+            [RETOC, "--version"],
+            LOG_DIR / "check.log",
+            timeout=60,
+        )
+
+        run_command(
+            [REPAK, "--version"],
+            LOG_DIR / "check.log",
+            timeout=60,
+        )
+
+        sys.exit(0)
+
+    if args.command == "list":
+        for name, folder in [
+            ("Awesome Spyglass", SPYGLASS_DIR),
+            ("Field Generators", FIELD_DIR),
+        ]:
+            log(name)
+
+            if not folder.is_dir():
+                log(f"Folder tidak ditemukan: {folder}", "WARN")
+                continue
+
+            for item in sorted(folder.iterdir()):
+                print(f"  {item.name}")
+
+        sys.exit(0)
+
+    results = []
+
+    if args.mod in ("spyglass", "both"):
+        results.append(
+            process_mod(
+                "Awesome Spyglass",
+                SPYGLASS_DIR,
+                "spyglass",
+            )
+        )
+
+    if args.mod in ("field", "both"):
+        results.append(
+            process_mod(
+                "Field Generators",
+                FIELD_DIR,
+                "field",
+            )
+        )
+
+    print()
+    log("========== HASIL ==========")
+
+    if results and all(results):
+        log("Ekstraksi selesai dan file output ditemukan.")
+    else:
+        log("Ada proses ekstraksi yang gagal.", "ERROR")
+        log("Jangan anggap file output parsial sebagai hasil berhasil.")
+
+    log(f"Folder output: {OUTPUT_BASE}")
+    log(f"Folder log   : {LOG_DIR}")
+    log("File sumber asli tidak diubah.")
+    log("Asset WindowsServer belum otomatis kompatibel dengan ARK Mobile.")
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+python -m py_compile Arkmod.py  blocks = parse_toc_compression_blocks(utoc)
 
     with tempfile.TemporaryDirectory(prefix="arkmod_") as tmp:
         raw_dir = os.path.join(tmp, "raw")
