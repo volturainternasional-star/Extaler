@@ -2,12 +2,30 @@
 
 Tool orchestrator untuk mengekstrak mod ARK Survival Ascended (WindowsServer) di Termux Android ARM64.
 
+## Pipeline (target perbaikan)
+
+1. **Retoc membaca index `.utoc`** (`retoc info` / `retoc list`).
+2. **Tool mengambil compressed chunk dari `.ucas`** (`retoc unpack-raw`).
+3. **Unoodle mendekompresi blok Oodle yang sesuai** (per-chunk, dengan `--length` dan `--header 0`).
+4. **Retoc memproses kembali data package** (`to-legacy` atau `unpack` pada hasil dekompresi).
+
+Hasil Spyglass dan Field Generators disimpan **terpisah**.
+
+### Catatan penting
+
+- **Unoodle tidak otomatis bisa mendekompresi seluruh `.ucas`**. Kita harus memastikan format chunk dan header-nya cocok terlebih dahulu.
+- **File original tidak pernah diubah**. Semua kerja di direktori output / temp.
+- Hasil ekstraksi adalah asset PC. Belum otomatis menjadi mod mobile yang berfungsi.
+- Membuat `.pak` mobile yang benar butuh cooking ulang di Unreal Engine Android, bukan hanya repack.
+
 ## Yang sudah tersedia
+
 - `retoc` → `~/retoc/target/release/retoc` (IoStore)
-- `repak` → `~/repak/target/release/repak` (classic .pak)
-- `unoodle` akan diinstall otomatis (pure Rust Oodle)
+- `repak` → `~/repak/target/release/repak` (classic `.pak`)
+- `unoodle` (pure Rust Oodle) — akan diinstall otomatis jika belum ada
 
 ## Install
+
 ```bash
 chmod +x install.sh
 ./install.sh
@@ -15,6 +33,7 @@ source ~/.bashrc
 ```
 
 ## Penggunaan
+
 ```bash
 arkmod check
 arkmod list
@@ -24,20 +43,15 @@ arkmod extract --mod field
 ```
 
 ## Output
+
 - `~/ark-mods/extracted/spyglass/`
 - `~/ark-mods/extracted/field/`
 
-## Batasan (penting)
-1. **Tidak memakai `libUE4.so`** (menghindari segfault).
-2. Mengandalkan `retoc` untuk IoStore dan `repak` untuk .pak.
-3. Jika Oodle gagal di retoc/repak, `unoodle` tersedia sebagai fallback manual.
-4. **Hasil ekstraksi adalah asset PC**. Belum otomatis menjadi mod mobile yang berfungsi.
-5. Membuat `.pak` mobile yang benar butuh cooking ulang di Unreal Engine Android, bukan hanya repack.
+Di dalam setiap output juga ada folder `_raw_and_decompressed/` untuk analisis manual.
 
-## Langkah selanjutnya (manual)
-Setelah extract berhasil:
-1. Analisis `.uasset` dengan tool yang kompatibel.
-2. Periksa dependency dan Blueprint.
-3. Cook ulang di UE untuk platform Android.
-4. Baru kemudian pack menjadi `.pak` mobile.
-5. 
+## Batasan
+
+1. Tidak memakai `libUE4.so` (menghindari segfault).
+2. Unoodle hanya dipakai pada blok yang sudah diisolasi dengan panjang yang diketahui/dicoba.
+3. Jika header version tidak cocok, script mencoba `--override-container-header-version PreInitial`.
+4. Hasil belum dijamin bisa langsung jadi mod mobile.
